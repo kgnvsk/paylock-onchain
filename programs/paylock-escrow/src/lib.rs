@@ -4,13 +4,11 @@ use anchor_spl::{
     token::{self, Mint, Token, TokenAccount, Transfer},
 };
 
-declare_id!("PLKescXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+declare_id!("BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8");
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-/// Basis points for fee calculation (1 bp = 0.01%)
-const FEE_BPS: u64 = 200; // 2% platform fee
+const FEE_BPS: u64 = 200;
 const BPS_DENOMINATOR: u64 = 10_000;
-/// Maximum length for metadata strings
 const MAX_DESCRIPTION_LEN: usize = 256;
 const MAX_DELIVERY_HASH_LEN: usize = 64;
 
@@ -20,12 +18,6 @@ pub mod paylock_escrow {
     use super::*;
 
     /// Create a new escrow agreement between a client and a provider.
-    ///
-    /// # Arguments
-    /// * `description`    – Human-readable description of the deliverable
-    /// * `delivery_hash`  – SHA-256 hex of expected delivery proof (optional)
-    /// * `amount`         – Total amount to be held in escrow (lamports or token units)
-    /// * `deadline`       – Unix timestamp after which dispute/cancel is allowed
     pub fn create_escrow(
         ctx: Context<CreateEscrow>,
         description: String,
@@ -53,10 +45,14 @@ pub mod paylock_escrow {
         escrow.bump = ctx.bumps.escrow;
         escrow.created_at = Clock::get()?.unix_timestamp;
 
+        let escrow_key = escrow.key();
+        let client_key = escrow.client;
+        let provider_key = escrow.provider;
+
         emit!(EscrowCreated {
-            escrow: escrow.key(),
-            client: escrow.client,
-            provider: escrow.provider,
+            escrow: escrow_key,
+            client: client_key,
+            provider: provider_key,
             amount,
             deadline,
         });
@@ -65,265 +61,273 @@ pub mod paylock_escrow {
     }
 
     /// Fund the escrow vault with tokens.
-    /// Only the client can fund; transfers `amount` tokens into the vault PDA.
     pub fn fund_escrow(ctx: Context<FundEscrow>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Created, EscrowError::InvalidStatus);
+        require!(
+            ctx.accounts.escrow.status == EscrowStatus::Created,
+            EscrowError::InvalidStatus
+        );
 
-        // Transfer tokens from client to vault
+        let amount = ctx.accounts.escrow.amount;
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.client_token_account.to_account_info(),
             to: ctx.accounts.vault.to_account_info(),
             authority: ctx.accounts.client.to_account_info(),
         };
         let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-        token::transfer(cpi_ctx, escrow.amount)?;
+        token::transfer(cpi_ctx, amount)?;
 
+        let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Funded;
 
-        emit!(EscrowFunded {
-            escrow: escrow.key(),
-            amount: escrow.amount,
-        });
+        emit!(EscrowFunded { escrow: escrow.key(), amount });
 
         Ok(())
     }
 
-    /// Provider submits delivery proof hash. Client then verifies or disputes.
+    /// Provider submits delivery proof hash.
     pub fn submit_delivery(ctx: Context<SubmitDelivery>, verify_hash: String) -> Result<()> {
         require!(verify_hash.len() <= MAX_DELIVERY_HASH_LEN, EscrowError::HashTooLong);
-
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Funded, EscrowError::InvalidStatus);
-
-        escrow.verify_hash = verify_hash;
-        escrow.status = EscrowStatus::DeliverySubmitted;
-
-        emit!(DeliverySubmitted {
-            escrow: escrow.key(),
-            provider: ctx.accounts.provider.key(),
-        });
-
-        Ok(())
-    }
-
-    /// Release funds to the provider after successful delivery verification.
-    /// Only the client can release (or auto-release if deadline passed).
-    /// Platform fee is deducted and sent to treasury.
-    pub fn release_escrow(ctx: Context<ReleaseEscrow>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
         require!(
-            escrow.status == EscrowStatus::Funded
-                || escrow.status == EscrowStatus::DeliverySubmitted,
+            ctx.accounts.escrow.status == EscrowStatus::Funded,
             EscrowError::InvalidStatus
         );
 
-        // Auto-verify: if delivery_hash matches verify_hash, approve automatically
-        let auto_approved = !escrow.delivery_hash.is_empty()
-            && !escrow.verify_hash.is_empty()
-            && escrow.delivery_hash == escrow.verify_hash;
+        let provider_key = ctx.accounts.provider.key();
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.verify_hash = verify_hash;
+        escrow.status = EscrowStatus::DeliverySubmitted;
 
-        let clock = Clock::get()?;
-        let caller_is_client = ctx.accounts.authority.key() == escrow.client;
-
-        require!(
-            caller_is_client || auto_approved || clock.unix_timestamp > escrow.deadline,
-            EscrowError::Unauthorized
-        );
-
-        // Calculate fee
-        let fee_amount = escrow.amount
-            .checked_mul(escrow.fee_bps)
-            .unwrap()
-            .checked_div(BPS_DENOMINATOR)
-            .unwrap();
-        let provider_amount = escrow.amount.checked_sub(fee_amount).unwrap();
-
-        let seeds = &[
-            b"escrow",
-            escrow.client.as_ref(),
-            escrow.provider.as_ref(),
-            &[escrow.bump],
-        ];
-        let signer_seeds = &[&seeds[..]];
-
-        // Transfer to provider
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault.to_account_info(),
-            to: ctx.accounts.provider_token_account.to_account_info(),
-            authority: ctx.accounts.escrow.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer_seeds,
-        );
-        token::transfer(cpi_ctx, provider_amount)?;
-
-        // Transfer fee to treasury
-        if fee_amount > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.treasury_token_account.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
-                signer_seeds,
-            );
-            token::transfer(cpi_ctx, fee_amount)?;
-        }
-
-        escrow.status = EscrowStatus::Released;
-
-        emit!(EscrowReleased {
-            escrow: escrow.key(),
-            provider_amount,
-            fee_amount,
-        });
+        emit!(DeliverySubmitted { escrow: escrow.key(), provider: provider_key });
 
         Ok(())
     }
 
-    /// Open a dispute. Either party can dispute after submission, before deadline.
-    pub fn dispute_escrow(ctx: Context<DisputeEscrow>, reason: String) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
+    /// Release funds to provider after delivery verification.
+    pub fn release_escrow(ctx: Context<ReleaseEscrow>) -> Result<()> {
+        // Validate status first before any borrows
         require!(
-            escrow.status == EscrowStatus::Funded
-                || escrow.status == EscrowStatus::DeliverySubmitted,
+            ctx.accounts.escrow.status == EscrowStatus::Funded
+                || ctx.accounts.escrow.status == EscrowStatus::DeliverySubmitted,
+            EscrowError::InvalidStatus
+        );
+
+        // Extract all needed values before mutable borrow
+        let auto_approved = !ctx.accounts.escrow.delivery_hash.is_empty()
+            && !ctx.accounts.escrow.verify_hash.is_empty()
+            && ctx.accounts.escrow.delivery_hash == ctx.accounts.escrow.verify_hash;
+
+        let clock = Clock::get()?;
+        let caller_is_client = ctx.accounts.authority.key() == ctx.accounts.escrow.client;
+
+        require!(
+            caller_is_client || auto_approved || clock.unix_timestamp > ctx.accounts.escrow.deadline,
+            EscrowError::Unauthorized
+        );
+
+        let amount = ctx.accounts.escrow.amount;
+        let fee_bps = ctx.accounts.escrow.fee_bps;
+        let client_key = ctx.accounts.escrow.client;
+        let provider_key = ctx.accounts.escrow.provider;
+        let bump = ctx.accounts.escrow.bump;
+
+        let fee_amount = amount.checked_mul(fee_bps).unwrap().checked_div(BPS_DENOMINATOR).unwrap();
+        let provider_amount = amount.checked_sub(fee_amount).unwrap();
+
+        // Build signer seeds
+        let client_ref = client_key.as_ref().to_vec();
+        let provider_ref = provider_key.as_ref().to_vec();
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[b"escrow", &client_ref, &provider_ref, &bump_arr];
+        let signer_seeds = &[seeds];
+
+        // Get account infos
+        let escrow_info = ctx.accounts.escrow.to_account_info();
+        let vault_info = ctx.accounts.vault.to_account_info();
+        let provider_ata_info = ctx.accounts.provider_token_account.to_account_info();
+        let treasury_info = ctx.accounts.treasury_token_account.to_account_info();
+        let token_program_info = ctx.accounts.token_program.to_account_info();
+
+        // Transfer to provider
+        token::transfer(
+            CpiContext::new_with_signer(
+                token_program_info.clone(),
+                Transfer {
+                    from: vault_info.clone(),
+                    to: provider_ata_info,
+                    authority: escrow_info.clone(),
+                },
+                signer_seeds,
+            ),
+            provider_amount,
+        )?;
+
+        // Transfer fee to treasury
+        if fee_amount > 0 {
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_program_info,
+                    Transfer {
+                        from: vault_info,
+                        to: treasury_info,
+                        authority: escrow_info,
+                    },
+                    signer_seeds,
+                ),
+                fee_amount,
+            )?;
+        }
+
+        let escrow = &mut ctx.accounts.escrow;
+        escrow.status = EscrowStatus::Released;
+
+        emit!(EscrowReleased { escrow: escrow.key(), provider_amount, fee_amount });
+
+        Ok(())
+    }
+
+    /// Open a dispute.
+    pub fn dispute_escrow(ctx: Context<DisputeEscrow>, reason: String) -> Result<()> {
+        require!(
+            ctx.accounts.escrow.status == EscrowStatus::Funded
+                || ctx.accounts.escrow.status == EscrowStatus::DeliverySubmitted,
             EscrowError::InvalidStatus
         );
 
         let caller = ctx.accounts.authority.key();
         require!(
-            caller == escrow.client || caller == escrow.provider,
+            caller == ctx.accounts.escrow.client || caller == ctx.accounts.escrow.provider,
             EscrowError::Unauthorized
         );
 
+        let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Disputed;
 
-        emit!(EscrowDisputed {
-            escrow: escrow.key(),
-            disputer: caller,
-            reason,
-        });
+        emit!(EscrowDisputed { escrow: escrow.key(), disputer: caller, reason });
 
         Ok(())
     }
 
-    /// Resolve a dispute. Only an arbitrator (treasury authority) can resolve.
-    /// `client_share_bps` — how many basis points go to client (rest to provider).
+    /// Resolve a dispute. Only arbitrator can call.
     pub fn resolve_dispute(ctx: Context<ResolveDispute>, client_share_bps: u64) -> Result<()> {
         require!(client_share_bps <= BPS_DENOMINATOR, EscrowError::InvalidAmount);
+        require!(
+            ctx.accounts.escrow.status == EscrowStatus::Disputed,
+            EscrowError::InvalidStatus
+        );
 
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Disputed, EscrowError::InvalidStatus);
+        let amount = ctx.accounts.escrow.amount;
+        let client_key = ctx.accounts.escrow.client;
+        let provider_key = ctx.accounts.escrow.provider;
+        let bump = ctx.accounts.escrow.bump;
 
-        let client_amount = escrow.amount
-            .checked_mul(client_share_bps)
-            .unwrap()
-            .checked_div(BPS_DENOMINATOR)
-            .unwrap();
-        let provider_amount = escrow.amount.checked_sub(client_amount).unwrap();
+        let client_amount = amount.checked_mul(client_share_bps).unwrap().checked_div(BPS_DENOMINATOR).unwrap();
+        let provider_amount = amount.checked_sub(client_amount).unwrap();
 
-        let seeds = &[
-            b"escrow",
-            escrow.client.as_ref(),
-            escrow.provider.as_ref(),
-            &[escrow.bump],
-        ];
-        let signer_seeds = &[&seeds[..]];
+        let client_ref = client_key.as_ref().to_vec();
+        let provider_ref = provider_key.as_ref().to_vec();
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[b"escrow", &client_ref, &provider_ref, &bump_arr];
+        let signer_seeds = &[seeds];
+
+        let escrow_info = ctx.accounts.escrow.to_account_info();
+        let vault_info = ctx.accounts.vault.to_account_info();
+        let token_program_info = ctx.accounts.token_program.to_account_info();
+        let client_ata_info = ctx.accounts.client_token_account.to_account_info();
+        let provider_ata_info = ctx.accounts.provider_token_account.to_account_info();
 
         if client_amount > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.client_token_account.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
-                signer_seeds,
-            );
-            token::transfer(cpi_ctx, client_amount)?;
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_program_info.clone(),
+                    Transfer {
+                        from: vault_info.clone(),
+                        to: client_ata_info,
+                        authority: escrow_info.clone(),
+                    },
+                    signer_seeds,
+                ),
+                client_amount,
+            )?;
         }
 
         if provider_amount > 0 {
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.vault.to_account_info(),
-                to: ctx.accounts.provider_token_account.to_account_info(),
-                authority: ctx.accounts.escrow.to_account_info(),
-            };
-            let cpi_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
-                signer_seeds,
-            );
-            token::transfer(cpi_ctx, provider_amount)?;
+            token::transfer(
+                CpiContext::new_with_signer(
+                    token_program_info,
+                    Transfer {
+                        from: vault_info,
+                        to: provider_ata_info,
+                        authority: escrow_info,
+                    },
+                    signer_seeds,
+                ),
+                provider_amount,
+            )?;
         }
 
+        let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Resolved;
 
-        emit!(DisputeResolved {
-            escrow: escrow.key(),
-            client_amount,
-            provider_amount,
-        });
+        emit!(DisputeResolved { escrow: escrow.key(), client_amount, provider_amount });
 
         Ok(())
     }
 
     /// Cancel an escrow and return funds to client.
-    /// Can only be cancelled if: not yet funded, or both parties agree, or deadline passed.
     pub fn cancel_escrow(ctx: Context<CancelEscrow>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-
         let clock = Clock::get()?;
         let caller = ctx.accounts.authority.key();
+        let status = ctx.accounts.escrow.status.clone();
+        let client_key = ctx.accounts.escrow.client;
+        let provider_key = ctx.accounts.escrow.provider;
+        let bump = ctx.accounts.escrow.bump;
+        let amount = ctx.accounts.escrow.amount;
 
-        match escrow.status {
+        match status {
             EscrowStatus::Created => {
-                // Client can cancel before funding
-                require!(caller == escrow.client, EscrowError::Unauthorized);
+                require!(caller == client_key, EscrowError::Unauthorized);
+                // No tokens to return — vault is empty
+                let escrow = &mut ctx.accounts.escrow;
+                escrow.status = EscrowStatus::Cancelled;
             }
             EscrowStatus::Funded | EscrowStatus::DeliverySubmitted => {
-                // After deadline, client can cancel; provider can always cancel (mutual agreement implied)
                 require!(
-                    clock.unix_timestamp > escrow.deadline || caller == escrow.provider,
+                    clock.unix_timestamp > ctx.accounts.escrow.deadline || caller == provider_key,
                     EscrowError::Unauthorized
                 );
 
-                // Refund client
-                let seeds = &[
-                    b"escrow",
-                    escrow.client.as_ref(),
-                    escrow.provider.as_ref(),
-                    &[escrow.bump],
-                ];
-                let signer_seeds = &[&seeds[..]];
+                let client_ref = client_key.as_ref().to_vec();
+                let provider_ref = provider_key.as_ref().to_vec();
+                let bump_arr = [bump];
+                let seeds: &[&[u8]] = &[b"escrow", &client_ref, &provider_ref, &bump_arr];
+                let signer_seeds = &[seeds];
 
-                let cpi_accounts = Transfer {
-                    from: ctx.accounts.vault.to_account_info(),
-                    to: ctx.accounts.client_token_account.to_account_info(),
-                    authority: ctx.accounts.escrow.to_account_info(),
-                };
-                let cpi_ctx = CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    cpi_accounts,
-                    signer_seeds,
-                );
-                token::transfer(cpi_ctx, escrow.amount)?;
+                let escrow_info = ctx.accounts.escrow.to_account_info();
+                let vault_info = ctx.accounts.vault.to_account_info();
+                let client_ata_info = ctx.accounts.client_token_account.to_account_info();
+                let token_program_info = ctx.accounts.token_program.to_account_info();
+
+                token::transfer(
+                    CpiContext::new_with_signer(
+                        token_program_info,
+                        Transfer {
+                            from: vault_info,
+                            to: client_ata_info,
+                            authority: escrow_info,
+                        },
+                        signer_seeds,
+                    ),
+                    amount,
+                )?;
+
+                let escrow = &mut ctx.accounts.escrow;
+                escrow.status = EscrowStatus::Cancelled;
             }
             _ => return err!(EscrowError::InvalidStatus),
         }
 
-        escrow.status = EscrowStatus::Cancelled;
-
-        emit!(EscrowCancelled {
-            escrow: escrow.key(),
-            cancelled_by: caller,
-        });
+        emit!(EscrowCancelled { escrow: ctx.accounts.escrow.key(), cancelled_by: caller });
 
         Ok(())
     }
@@ -337,7 +341,7 @@ pub struct CreateEscrow<'info> {
     #[account(mut)]
     pub client: Signer<'info>,
 
-    /// CHECK: Provider pubkey, validated in logic
+    /// CHECK: Provider pubkey — no validation needed, stored in escrow state
     pub provider: AccountInfo<'info>,
 
     pub mint: Account<'info, Mint>,
@@ -456,7 +460,6 @@ pub struct DisputeEscrow<'info> {
 
 #[derive(Accounts)]
 pub struct ResolveDispute<'info> {
-    /// CHECK: Arbitrator — must be the treasury authority
     pub arbitrator: Signer<'info>,
 
     #[account(
@@ -524,50 +527,31 @@ pub struct CancelEscrow<'info> {
 
 #[account]
 pub struct EscrowAccount {
-    /// The client who creates and funds the escrow
     pub client: Pubkey,
-    /// The service provider who fulfills the contract
     pub provider: Pubkey,
-    /// SPL token mint (e.g., USDC)
     pub mint: Pubkey,
-    /// Vault PDA holding the tokens
     pub vault: Pubkey,
-    /// Total escrow amount in token units
     pub amount: u64,
-    /// Platform fee in basis points (200 = 2%)
     pub fee_bps: u64,
-    /// Deadline unix timestamp
     pub deadline: i64,
-    /// Created at unix timestamp
     pub created_at: i64,
-    /// Human-readable description
     pub description: String,
-    /// SHA-256 hex of expected delivery (set at creation)
     pub delivery_hash: String,
-    /// SHA-256 hex submitted by provider as proof
     pub verify_hash: String,
-    /// Current escrow status
     pub status: EscrowStatus,
-    /// PDA bump
     pub bump: u8,
 }
 
 impl EscrowAccount {
-    pub const SPACE: usize = 8          // discriminator
-        + 32                            // client
-        + 32                            // provider
-        + 32                            // mint
-        + 32                            // vault
-        + 8                             // amount
-        + 8                             // fee_bps
-        + 8                             // deadline
-        + 8                             // created_at
-        + 4 + MAX_DESCRIPTION_LEN       // description
-        + 4 + MAX_DELIVERY_HASH_LEN     // delivery_hash
-        + 4 + MAX_DELIVERY_HASH_LEN     // verify_hash
-        + 1                             // status enum
-        + 1                             // bump
-        + 64;                           // padding
+    pub const SPACE: usize = 8
+        + 32 + 32 + 32 + 32  // pubkeys
+        + 8 + 8 + 8 + 8      // u64/i64 fields
+        + 4 + MAX_DESCRIPTION_LEN
+        + 4 + MAX_DELIVERY_HASH_LEN
+        + 4 + MAX_DELIVERY_HASH_LEN
+        + 1                   // status
+        + 1                   // bump
+        + 64;                 // padding
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]

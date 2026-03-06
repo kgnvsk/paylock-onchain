@@ -3,7 +3,7 @@ seeds = false
 skip-lint = false
 
 [programs.devnet]
-paylock_escrow = "PLKescXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+paylock_escrow = "BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8"
 
 [registry]
 url = "https://api.apr.dev"
