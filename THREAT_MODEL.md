@@ -1,67 +1,30 @@
 # Paylock On-Chain Escrow Threat Model
 
 ## Scope
-Smart contract: `programs/paylock-escrow/src/lib.rs` (Anchor/Solana).  
-Assets in scope: escrowed SPL tokens, escrow state correctness, release/dispute authorization.
+Program: `programs/paylock-escrow/src/lib.rs`.
+Assets: escrowed SPL token funds, escrow state, role bindings (`client/provider/arbitrator/treasury`), and delivery proof integrity.
 
-## Security Objectives
-1. Funds only move according to explicit state transitions.
-2. Only authorized actors (client/provider/arbitrator/treasury binding) can trigger privileged actions.
-3. Delivery verification cannot be spoofed via malformed hashes.
-4. Fee routing cannot be redirected away from bound treasury.
+## Threat scenarios and mitigations
 
-## Trust Boundaries
-- **On-chain program boundary**: all critical authorization and state checks must be enforced by account constraints + runtime checks.
-- **Signer boundary**: any signer not matching bound escrow roles is untrusted.
-- **Token program CPI boundary**: SPL token transfers rely on correct PDA signer seeds and vault authority.
-- **Off-chain boundary**: clients/providers can submit arbitrary strings and timing; all inputs are adversarial.
+| Threat | Attack path | Mitigation in code | Test coverage |
+|---|---|---|---|
+| Unauthorized release/cancel/dispute/resolve | Wrong signer calls privileged instruction | Signer + role checks, `has_one` constraints, status guards | `authorization matrix` and `forbidden transition` tests in `tests/paylock-escrow.ts` |
+| Treasury redirection | Caller supplies alternate treasury to siphon fee | `ReleaseEscrow` enforces `has_one = treasury` bound at create | `rejects wrong treasury` |
+| Arbitrator impersonation | Rogue signer resolves dispute | `ResolveDispute` enforces `has_one = arbitrator` | `rejects wrong arbitrator` |
+| Proof format confusion | Malformed hash (wrong len/non-hex/mixed junk) accepted | Central `Sha256HexProof::parse` enforces exact 64-char hex | Rust unit tests + TS malformed payload tests |
+| Deadline boundary abuse | Calls at `== now` or before/after deadline to bypass policy | Strict `deadline > now` at create and strict `now > deadline` for timeout paths | Deadline edge tests (`==`, `<`, `>`) |
+| Replay after terminal transition | Re-run release/dispute/cancel/fund after completion | Terminal states rejected by status machine guards | Anti-replay tests across Released/Resolved/Cancelled |
+| Invalid state transitions | e.g., submit before fund, resolve outside disputed | Explicit transition guards per instruction | Forbidden-transition matrix tests |
+| Arithmetic bug in split/fee math | Overflow/underflow in fee or resolution split | Checked arithmetic + explicit overflow errors | Existing release/resolve flow tests |
 
-## Key Attack Scenarios & Mitigations
+## Security invariants
+1. Funds move only under allowed state transitions.
+2. Terminal states are final (`Released`, `Resolved`, `Cancelled`).
+3. Role bindings (treasury/arbitrator/client/provider) are immutable for an escrow.
+4. Proof values are canonicalized SHA-256 hex strings.
+5. Fee transfer uses fixed basis points and is routed only to bound treasury.
 
-### 1) Unauthorized state transitions
-- **Scenario**: attacker or wrong role calls `submit_delivery`, `dispute_escrow`, `release_escrow`, `resolve_dispute`, or `cancel_escrow`.
-- **Impact**: premature release, denial of service, or dispute manipulation.
-- **Mitigations**:
-  - Anchor `has_one` constraints on role accounts (provider, arbitrator, treasury).
-  - Signer checks + explicit runtime authorization checks.
-  - State machine guards (`InvalidStatus`) on every transition.
-
-### 2) Hash ambiguity / malformed commitment bypass
-- **Scenario**: submit short/non-hex/garbage delivery hashes to bypass meaningful proof matching.
-- **Impact**: false auto-approval or unverifiable commitment workflow.
-- **Mitigations**:
-  - Enforce SHA-256 hex format exactly (64 hex chars) in `create_escrow` and `submit_delivery`.
-  - Reject malformed values with explicit `InvalidHashFormat`.
-
-### 3) Treasury redirection attack
-- **Scenario**: caller passes alternate treasury account during release.
-- **Impact**: protocol fee theft.
-- **Mitigations**:
-  - Escrow stores treasury at creation.
-  - `ReleaseEscrow` requires `has_one = treasury`; mismatched treasury fails.
-
-### 4) Arbitrator impersonation
-- **Scenario**: non-designated signer resolves dispute.
-- **Impact**: forced unfair split.
-- **Mitigations**:
-  - Escrow stores arbitrator at creation.
-  - `ResolveDispute` enforces `has_one = arbitrator`.
-
-### 5) Deadline edge abuse
-- **Scenario**: create escrow with already-expired deadline or exploit boundary timestamps.
-- **Impact**: immediate unauthorized timeout actions or broken UX/security assumptions.
-- **Mitigations**:
-  - `create_escrow` requires `deadline > now`.
-  - timeout-dependent flows use strict comparisons and are covered by explicit edge tests.
-
-## Residual Risks / Notes
-- Off-chain delivery semantics are only as strong as hash preimage process and business workflow.
-- Timestamp dependency uses Solana clock and is subject to normal block-time variance.
-- No emergency pause/admin override in current design (intentional decentralization tradeoff).
-
-## Test Coverage Mapping
-Hardening tests now include:
-- Negative auth cases (unauthorized dispute, mismatch treasury/arbitrator).
-- State machine negatives (submit before funding).
-- Hash validation negatives (create + submit delivery).
-- Deadline boundary check (deadline == now rejected).
+## Residual risks
+- Dispute fairness depends on trusted arbitrator model (by design in this phase).
+- Clock-based deadlines depend on Solana timestamp variance.
+- Off-chain artifact correctness is only as strong as the commitment workflow around hash preimages.
