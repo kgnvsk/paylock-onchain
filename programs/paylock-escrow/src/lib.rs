@@ -41,6 +41,8 @@ pub mod paylock_escrow {
         escrow.description = description;
         escrow.delivery_hash = delivery_hash;
         escrow.verify_hash = String::new();
+        escrow.arbitrator = ctx.accounts.arbitrator.key();
+        escrow.treasury = ctx.accounts.treasury.key();
         escrow.status = EscrowStatus::Created;
         escrow.bump = ctx.bumps.escrow;
         escrow.created_at = Clock::get()?.unix_timestamp;
@@ -292,10 +294,8 @@ pub mod paylock_escrow {
                 escrow.status = EscrowStatus::Cancelled;
             }
             EscrowStatus::Funded | EscrowStatus::DeliverySubmitted => {
-                require!(
-                    clock.unix_timestamp > ctx.accounts.escrow.deadline || caller == provider_key,
-                    EscrowError::Unauthorized
-                );
+                require!(caller == client_key, EscrowError::Unauthorized);
+                require!(clock.unix_timestamp > ctx.accounts.escrow.deadline, EscrowError::Unauthorized);
 
                 let client_ref = client_key.as_ref().to_vec();
                 let provider_ref = provider_key.as_ref().to_vec();
@@ -345,6 +345,12 @@ pub struct CreateEscrow<'info> {
     pub provider: AccountInfo<'info>,
 
     pub mint: Account<'info, Mint>,
+
+    /// CHECK: Arbitrator allowed to resolve disputes for this escrow
+    pub arbitrator: AccountInfo<'info>,
+
+    /// CHECK: Treasury authority that receives fees for this escrow
+    pub treasury: AccountInfo<'info>,
 
     #[account(
         init,
@@ -418,10 +424,14 @@ pub struct SubmitDelivery<'info> {
 pub struct ReleaseEscrow<'info> {
     pub authority: Signer<'info>,
 
+    /// CHECK: Treasury authority bound to escrow at creation time
+    pub treasury: AccountInfo<'info>,
+
     #[account(
         mut,
         seeds = [b"escrow", escrow.client.as_ref(), escrow.provider.as_ref()],
         bump = escrow.bump,
+        has_one = treasury,
     )]
     pub escrow: Account<'info, EscrowAccount>,
 
@@ -439,7 +449,11 @@ pub struct ReleaseEscrow<'info> {
     )]
     pub provider_token_account: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        associated_token::mint = escrow.mint,
+        associated_token::authority = treasury,
+    )]
     pub treasury_token_account: Account<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token>,
@@ -466,6 +480,7 @@ pub struct ResolveDispute<'info> {
         mut,
         seeds = [b"escrow", escrow.client.as_ref(), escrow.provider.as_ref()],
         bump = escrow.bump,
+        has_one = arbitrator,
     )]
     pub escrow: Account<'info, EscrowAccount>,
 
@@ -531,6 +546,8 @@ pub struct EscrowAccount {
     pub provider: Pubkey,
     pub mint: Pubkey,
     pub vault: Pubkey,
+    pub arbitrator: Pubkey,
+    pub treasury: Pubkey,
     pub amount: u64,
     pub fee_bps: u64,
     pub deadline: i64,
@@ -544,7 +561,7 @@ pub struct EscrowAccount {
 
 impl EscrowAccount {
     pub const SPACE: usize = 8
-        + 32 + 32 + 32 + 32  // pubkeys
+        + 32 + 32 + 32 + 32 + 32 + 32  // pubkeys
         + 8 + 8 + 8 + 8      // u64/i64 fields
         + 4 + MAX_DESCRIPTION_LEN
         + 4 + MAX_DELIVERY_HASH_LEN

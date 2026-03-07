@@ -145,6 +145,8 @@ describe("PayLock Escrow", () => {
         client: client.publicKey,
         provider: serviceProvider.publicKey,
         mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
         escrow: escrowPDA,
         vault: vaultPDA,
         systemProgram: SystemProgram.programId,
@@ -232,6 +234,7 @@ describe("PayLock Escrow", () => {
       .releaseEscrow()
       .accounts({
         authority: client.publicKey,
+        treasury: treasury.publicKey,
         escrow: escrowPDA,
         vault: vaultPDA,
         providerTokenAccount,
@@ -305,7 +308,11 @@ describe("PayLock Escrow", () => {
       .accounts({
         client: client2.publicKey,
         provider: provider2.publicKey,
-        mint, escrow: escrow2PDA, vault: vault2PDA,
+        mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
+        escrow: escrow2PDA,
+        vault: vault2PDA,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID,
         associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -382,7 +389,11 @@ describe("PayLock Escrow", () => {
       .createEscrow("Cancel test", "", new BN(500_000), new BN(deadline))
       .accounts({
         client: client3.publicKey, provider: provider3.publicKey,
-        mint, escrow: escrow3PDA, vault: vault3PDA,
+        mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
+        escrow: escrow3PDA,
+        vault: vault3PDA,
         systemProgram: SystemProgram.programId,
         tokenProgram: TOKEN_PROGRAM_ID, associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
         rent: SYSVAR_RENT_PUBKEY,
