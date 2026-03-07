@@ -495,4 +495,172 @@ describe("PayLock Escrow", () => {
     const escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
     expect(escrow.status).to.deep.equal({ disputed: {} });
   });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 10. RESOLVE DISPUTE (ARBITRATION)
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("Arbitrator resolves dispute with 70/30 split", async () => {
+    const c = await createCase({ amount: 1_000_000 });
+    await fundCase(c);
+
+    // Dispute it
+    await program.methods.disputeEscrow("quality issue").accounts({
+      authority: c.client.publicKey,
+      escrow: c.escrowPDA,
+    }).rpc();
+
+    let escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
+    expect(escrow.status).to.deep.equal({ disputed: {} });
+
+    // Arbitrator resolves: 70% to client, 30% to provider
+    await program.methods.resolveDispute(new BN(7000)).accounts({
+      arbitrator: treasury.publicKey,
+      escrow: c.escrowPDA,
+      vault: c.vaultPDA,
+      clientTokenAccount: c.clientAta,
+      providerTokenAccount: c.providerAta,
+    }).signers([treasury]).rpc();
+
+    escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
+    expect(escrow.status).to.deep.equal({ resolved: {} });
+
+    // Verify vault is empty
+    const vaultBal = await provider.connection.getTokenAccountBalance(c.vaultPDA);
+    expect(vaultBal.value.amount).to.equal("0");
+  });
+
+  it("Arbitrator resolves dispute with 100% to client", async () => {
+    const c = await createCase({ amount: 500_000 });
+    await fundCase(c);
+    await program.methods.disputeEscrow("total failure").accounts({
+      authority: c.client.publicKey,
+      escrow: c.escrowPDA,
+    }).rpc();
+
+    const clientBalBefore = await provider.connection.getTokenAccountBalance(c.clientAta);
+
+    await program.methods.resolveDispute(new BN(10_000)).accounts({
+      arbitrator: treasury.publicKey,
+      escrow: c.escrowPDA,
+      vault: c.vaultPDA,
+      clientTokenAccount: c.clientAta,
+      providerTokenAccount: c.providerAta,
+    }).signers([treasury]).rpc();
+
+    const clientBalAfter = await provider.connection.getTokenAccountBalance(c.clientAta);
+    const diff = Number(clientBalAfter.value.amount) - Number(clientBalBefore.value.amount);
+    expect(diff).to.equal(500_000); // client gets 100%
+  });
+
+  it("Non-arbitrator cannot resolve dispute", async () => {
+    const c = await createCase();
+    await fundCase(c);
+    await program.methods.disputeEscrow("test").accounts({
+      authority: c.client.publicKey,
+      escrow: c.escrowPDA,
+    }).rpc();
+
+    try {
+      await program.methods.resolveDispute(new BN(5000)).accounts({
+        arbitrator: outsider.publicKey,
+        escrow: c.escrowPDA,
+        vault: c.vaultPDA,
+        clientTokenAccount: c.clientAta,
+        providerTokenAccount: c.providerAta,
+      }).signers([outsider]).rpc();
+      expect.fail("Should reject non-arbitrator");
+    } catch (e: any) {
+      // has_one constraint throws ConstraintHasOne error
+      const msg = e.toString();
+      expect(msg.includes("has_one") || msg.includes("ConstraintHasOne") || msg.includes("2001") || msg.includes("AnchorError")).to.be.true;
+    }
+  });
+
+  it("Cannot resolve non-disputed escrow", async () => {
+    const c = await createCase();
+    await fundCase(c);
+
+    try {
+      await program.methods.resolveDispute(new BN(5000)).accounts({
+        arbitrator: treasury.publicKey,
+        escrow: c.escrowPDA,
+        vault: c.vaultPDA,
+        clientTokenAccount: c.clientAta,
+        providerTokenAccount: c.providerAta,
+      }).signers([treasury]).rpc();
+      expect.fail("Should reject resolve on non-disputed");
+    } catch (e: any) {
+      expect(e.toString()).to.include("InvalidStatus");
+    }
+  });
+
+  it("Rejects resolve with invalid share (>100%)", async () => {
+    const c = await createCase();
+    await fundCase(c);
+    await program.methods.disputeEscrow("test").accounts({
+      authority: c.client.publicKey,
+      escrow: c.escrowPDA,
+    }).rpc();
+
+    try {
+      await program.methods.resolveDispute(new BN(15_000)).accounts({
+        arbitrator: treasury.publicKey,
+        escrow: c.escrowPDA,
+        vault: c.vaultPDA,
+        clientTokenAccount: c.clientAta,
+        providerTokenAccount: c.providerAta,
+      }).signers([treasury]).rpc();
+      expect.fail("Should reject >100% share");
+    } catch (e: any) {
+      expect(e.toString()).to.include("InvalidAmount");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 11. DESCRIPTION VALIDATION
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("Rejects description exceeding 256 characters", async () => {
+    const sp = Keypair.generate();
+    const longDesc = "x".repeat(257);
+
+    try {
+      await program.methods
+        .createEscrow(longDesc, VALID_HASH, new BN(1_000_000), new BN(Math.floor(Date.now()/1000) + 3600))
+        .accounts({
+          client: wallet.publicKey,
+          provider: sp.publicKey,
+          mint,
+          arbitrator: treasury.publicKey,
+          treasury: treasury.publicKey,
+        })
+        .rpc();
+      expect.fail("Should reject long description");
+    } catch (e: any) {
+      expect(e.toString()).to.include("DescriptionTooLong");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 12. BALANCE VERIFICATION AFTER RELEASE
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("Release transfers correct amounts to provider and treasury", async () => {
+    const c = await createCase({ amount: 1_000_000 });
+
+    const providerBalBefore = await provider.connection.getTokenAccountBalance(c.providerAta);
+    const treasuryBalBefore = await provider.connection.getTokenAccountBalance(c.treasuryAta);
+
+    await fundCase(c);
+    await submitDelivery(c);
+    await releaseCase(c);
+
+    const providerBalAfter = await provider.connection.getTokenAccountBalance(c.providerAta);
+    const treasuryBalAfter = await provider.connection.getTokenAccountBalance(c.treasuryAta);
+
+    const providerDiff = Number(providerBalAfter.value.amount) - Number(providerBalBefore.value.amount);
+    const treasuryDiff = Number(treasuryBalAfter.value.amount) - Number(treasuryBalBefore.value.amount);
+
+    // 2% fee: 1_000_000 * 200 / 10_000 = 20_000
+    expect(providerDiff).to.equal(980_000);
+    expect(treasuryDiff).to.equal(20_000);
+  });
 });
