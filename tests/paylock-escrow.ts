@@ -343,4 +343,156 @@ describe("PayLock Escrow", () => {
     const escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
     expect(escrow.status).to.deep.equal({ cancelled: {} });
   });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 7. DEADLINE EDGE BEHAVIOR
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("Rejects creating escrow with deadline in the past", async () => {
+    const sp = Keypair.generate();
+    const pastDeadline = Math.floor(Date.now() / 1000) - 60;
+
+    try {
+      await program.methods
+        .createEscrow("past deadline", VALID_HASH, new BN(1_000_000), new BN(pastDeadline))
+        .accounts({
+          client: wallet.publicKey,
+          provider: sp.publicKey,
+          mint,
+          arbitrator: treasury.publicKey,
+          treasury: treasury.publicKey,
+        })
+        .rpc();
+      expect.fail("Should reject past deadline");
+    } catch (e: any) {
+      expect(e.toString()).to.include("DeadlineInPast");
+    }
+  });
+
+  it("Client cannot cancel funded escrow before deadline expires", async () => {
+    const c = await createCase({ deadlineDelta: 7200 }); // 2 hours from now
+    await fundCase(c);
+
+    try {
+      await program.methods.cancelEscrow().accounts({
+        authority: c.client.publicKey,
+        escrow: c.escrowPDA,
+        vault: c.vaultPDA,
+        clientTokenAccount: c.clientAta,
+      }).rpc();
+      expect.fail("Should reject cancel before deadline");
+    } catch (e: any) {
+      expect(e.toString()).to.include("Unauthorized");
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 8. EVENTS EMITTED WITH REQUIRED FIELDS
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("EscrowCreated event contains all required fields", async () => {
+    const serviceProvider = Keypair.generate();
+    const amount = 500_000;
+    const deadline = Math.floor(Date.now() / 1000) + 3600;
+
+    const [escrowPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("escrow"), wallet.publicKey.toBuffer(), serviceProvider.publicKey.toBuffer()],
+      program.programId
+    );
+
+    const listener = program.addEventListener("escrowCreated", (event: any) => {
+      expect(event.escrow.toString()).to.equal(escrowPDA.toString());
+      expect(event.client.toString()).to.equal(wallet.publicKey.toString());
+      expect(event.provider.toString()).to.equal(serviceProvider.publicKey.toString());
+      expect(event.amount.toNumber()).to.equal(amount);
+      expect(event.feeBps.toNumber()).to.equal(200);
+      expect(event.deadline.toNumber()).to.equal(deadline);
+    });
+
+    try {
+      await program.methods
+        .createEscrow("event test", VALID_HASH, new BN(amount), new BN(deadline))
+        .accounts({
+          client: wallet.publicKey,
+          provider: serviceProvider.publicKey,
+          mint,
+          arbitrator: treasury.publicKey,
+          treasury: treasury.publicKey,
+        })
+        .rpc();
+
+      // Verify the escrow was created (event listener runs async)
+      const escrow = await program.account.escrowAccount.fetch(escrowPDA);
+      expect(escrow.amount.toNumber()).to.equal(amount);
+      expect(escrow.feeBps.toNumber()).to.equal(200);
+      expect(escrow.client.toString()).to.equal(wallet.publicKey.toString());
+      expect(escrow.provider.toString()).to.equal(serviceProvider.publicKey.toString());
+    } finally {
+      await program.removeEventListener(listener);
+    }
+  });
+
+  it("EscrowFunded and EscrowReleased events fire with correct amounts", async () => {
+    const c = await createCase({ amount: 1_000_000 });
+
+    const fundedEvents: any[] = [];
+    const releasedEvents: any[] = [];
+
+    const fundListener = program.addEventListener("escrowFunded", (event: any) => {
+      fundedEvents.push(event);
+    });
+    const releaseListener = program.addEventListener("escrowReleased", (event: any) => {
+      releasedEvents.push(event);
+    });
+
+    try {
+      await fundCase(c);
+      await submitDelivery(c);
+      await releaseCase(c);
+
+      // Check fund event
+      expect(fundedEvents.length).to.be.gte(1);
+      const fundEvent = fundedEvents.find((e: any) => e.escrow.toString() === c.escrowPDA.toString());
+      expect(fundEvent).to.not.be.undefined;
+      expect(fundEvent.amount.toNumber()).to.equal(1_000_000);
+
+      // Check release event — provider gets 98%, treasury gets 2%
+      expect(releasedEvents.length).to.be.gte(1);
+      const releaseEvent = releasedEvents.find((e: any) => e.escrow.toString() === c.escrowPDA.toString());
+      expect(releaseEvent).to.not.be.undefined;
+      expect(releaseEvent.amount.toNumber()).to.equal(1_000_000);
+      expect(releaseEvent.feeAmount.toNumber()).to.equal(20_000); // 2% of 1M
+      expect(releaseEvent.providerAmount.toNumber()).to.equal(980_000); // 98% of 1M
+    } finally {
+      await program.removeEventListener(fundListener);
+      await program.removeEventListener(releaseListener);
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 9. DISPUTE FLOW
+  // ═══════════════════════════════════════════════════════════════════════════
+  it("Client can dispute funded escrow", async () => {
+    const c = await createCase();
+    await fundCase(c);
+
+    await program.methods.disputeEscrow("quality issue").accounts({
+      authority: c.client.publicKey,
+      escrow: c.escrowPDA,
+    }).rpc();
+
+    const escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
+    expect(escrow.status).to.deep.equal({ disputed: {} });
+  });
+
+  it("Provider can dispute funded escrow", async () => {
+    const c = await createCase();
+    await fundCase(c);
+
+    await program.methods.disputeEscrow("scope change").accounts({
+      authority: c.serviceProvider.publicKey,
+      escrow: c.escrowPDA,
+    }).signers([c.serviceProvider]).rpc();
+
+    const escrow = await program.account.escrowAccount.fetch(c.escrowPDA);
+    expect(escrow.status).to.deep.equal({ disputed: {} });
+  });
 });
