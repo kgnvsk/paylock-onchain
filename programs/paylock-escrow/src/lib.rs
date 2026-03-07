@@ -131,8 +131,8 @@ pub mod paylock_escrow {
         let provider_key = ctx.accounts.escrow.provider;
         let bump = ctx.accounts.escrow.bump;
 
-        let fee_amount = amount.checked_mul(fee_bps).unwrap().checked_div(BPS_DENOMINATOR).unwrap();
-        let provider_amount = amount.checked_sub(fee_amount).unwrap();
+        let fee_amount = amount.checked_mul(fee_bps).ok_or(EscrowError::ArithmeticOverflow)?.checked_div(BPS_DENOMINATOR).ok_or(EscrowError::ArithmeticOverflow)?;
+        let provider_amount = amount.checked_sub(fee_amount).ok_or(EscrowError::ArithmeticOverflow)?;
 
         // Build signer seeds
         let client_ref = client_key.as_ref().to_vec();
@@ -221,8 +221,8 @@ pub mod paylock_escrow {
         let provider_key = ctx.accounts.escrow.provider;
         let bump = ctx.accounts.escrow.bump;
 
-        let client_amount = amount.checked_mul(client_share_bps).unwrap().checked_div(BPS_DENOMINATOR).unwrap();
-        let provider_amount = amount.checked_sub(client_amount).unwrap();
+        let client_amount = amount.checked_mul(client_share_bps).ok_or(EscrowError::ArithmeticOverflow)?.checked_div(BPS_DENOMINATOR).ok_or(EscrowError::ArithmeticOverflow)?;
+        let provider_amount = amount.checked_sub(client_amount).ok_or(EscrowError::ArithmeticOverflow)?;
 
         let client_ref = client_key.as_ref().to_vec();
         let provider_ref = provider_key.as_ref().to_vec();
@@ -631,4 +631,6 @@ pub enum EscrowError {
     DescriptionTooLong,
     #[msg("Hash exceeds maximum length of 64 characters")]
     HashTooLong,
+    #[msg("Arithmetic overflow in fee calculation")]
+    ArithmeticOverflow,
 }
