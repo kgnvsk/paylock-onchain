@@ -10,10 +10,24 @@ declare_id!("BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8");
 const FEE_BPS: u64 = 200;
 const BPS_DENOMINATOR: u64 = 10_000;
 const MAX_DESCRIPTION_LEN: usize = 256;
-const MAX_DELIVERY_HASH_LEN: usize = 64;
+const SHA256_HEX_LEN: usize = 64;
 
-fn is_valid_sha256_hex(hash: &str) -> bool {
-    hash.len() == MAX_DELIVERY_HASH_LEN && hash.bytes().all(|b| b.is_ascii_hexdigit())
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Sha256HexProof(String);
+
+impl Sha256HexProof {
+    fn parse(value: &str) -> Result<Self> {
+        require!(value.len() == SHA256_HEX_LEN, EscrowError::InvalidHashFormat);
+        require!(
+            value.bytes().all(|b| b.is_ascii_hexdigit()),
+            EscrowError::InvalidHashFormat
+        );
+        Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 // ─── Program ─────────────────────────────────────────────────────────────────
@@ -33,14 +47,7 @@ pub mod paylock_escrow {
             description.len() <= MAX_DESCRIPTION_LEN,
             EscrowError::DescriptionTooLong
         );
-        require!(
-            delivery_hash.len() <= MAX_DELIVERY_HASH_LEN,
-            EscrowError::HashTooLong
-        );
-        require!(
-            is_valid_sha256_hex(&delivery_hash),
-            EscrowError::InvalidHashFormat
-        );
+        let delivery_hash = Sha256HexProof::parse(&delivery_hash)?.into_inner();
         require!(amount > 0, EscrowError::InvalidAmount);
         require!(
             deadline > Clock::get()?.unix_timestamp,
@@ -70,9 +77,11 @@ pub mod paylock_escrow {
 
         emit!(EscrowCreated {
             escrow: escrow_key,
+            actor: client_key,
             client: client_key,
             provider: provider_key,
             amount,
+            fee_bps: FEE_BPS,
             deadline,
         });
 
@@ -101,6 +110,7 @@ pub mod paylock_escrow {
 
         emit!(EscrowFunded {
             escrow: escrow.key(),
+            actor: ctx.accounts.client.key(),
             amount
         });
 
@@ -109,14 +119,7 @@ pub mod paylock_escrow {
 
     /// Provider submits delivery proof hash.
     pub fn submit_delivery(ctx: Context<SubmitDelivery>, verify_hash: String) -> Result<()> {
-        require!(
-            verify_hash.len() <= MAX_DELIVERY_HASH_LEN,
-            EscrowError::HashTooLong
-        );
-        require!(
-            is_valid_sha256_hex(&verify_hash),
-            EscrowError::InvalidHashFormat
-        );
+        let verify_hash = Sha256HexProof::parse(&verify_hash)?.into_inner();
         require!(
             ctx.accounts.escrow.status == EscrowStatus::Funded,
             EscrowError::InvalidStatus
@@ -129,7 +132,8 @@ pub mod paylock_escrow {
 
         emit!(DeliverySubmitted {
             escrow: escrow.key(),
-            provider: provider_key
+            actor: provider_key,
+            verify_hash: escrow.verify_hash.clone(),
         });
 
         Ok(())
@@ -223,6 +227,8 @@ pub mod paylock_escrow {
 
         emit!(EscrowReleased {
             escrow: escrow.key(),
+            actor: ctx.accounts.authority.key(),
+            amount,
             provider_amount,
             fee_amount
         });
@@ -249,7 +255,7 @@ pub mod paylock_escrow {
 
         emit!(EscrowDisputed {
             escrow: escrow.key(),
-            disputer: caller,
+            actor: caller,
             reason
         });
 
@@ -328,6 +334,8 @@ pub mod paylock_escrow {
 
         emit!(DisputeResolved {
             escrow: escrow.key(),
+            actor: ctx.accounts.arbitrator.key(),
+            amount,
             client_amount,
             provider_amount
         });
@@ -391,7 +399,8 @@ pub mod paylock_escrow {
 
         emit!(EscrowCancelled {
             escrow: ctx.accounts.escrow.key(),
-            cancelled_by: caller
+            actor: caller,
+            amount,
         });
 
         Ok(())
@@ -629,8 +638,8 @@ impl EscrowAccount {
         + 32 + 32 + 32 + 32 + 32 + 32  // pubkeys
         + 8 + 8 + 8 + 8      // u64/i64 fields
         + 4 + MAX_DESCRIPTION_LEN
-        + 4 + MAX_DELIVERY_HASH_LEN
-        + 4 + MAX_DELIVERY_HASH_LEN
+        + 4 + SHA256_HEX_LEN
+        + 4 + SHA256_HEX_LEN
         + 1                   // status
         + 1                   // bump
         + 64; // padding
@@ -652,27 +661,33 @@ pub enum EscrowStatus {
 #[event]
 pub struct EscrowCreated {
     pub escrow: Pubkey,
+    pub actor: Pubkey,
     pub client: Pubkey,
     pub provider: Pubkey,
     pub amount: u64,
+    pub fee_bps: u64,
     pub deadline: i64,
 }
 
 #[event]
 pub struct EscrowFunded {
     pub escrow: Pubkey,
+    pub actor: Pubkey,
     pub amount: u64,
 }
 
 #[event]
 pub struct DeliverySubmitted {
     pub escrow: Pubkey,
-    pub provider: Pubkey,
+    pub actor: Pubkey,
+    pub verify_hash: String,
 }
 
 #[event]
 pub struct EscrowReleased {
     pub escrow: Pubkey,
+    pub actor: Pubkey,
+    pub amount: u64,
     pub provider_amount: u64,
     pub fee_amount: u64,
 }
@@ -680,13 +695,15 @@ pub struct EscrowReleased {
 #[event]
 pub struct EscrowDisputed {
     pub escrow: Pubkey,
-    pub disputer: Pubkey,
+    pub actor: Pubkey,
     pub reason: String,
 }
 
 #[event]
 pub struct DisputeResolved {
     pub escrow: Pubkey,
+    pub actor: Pubkey,
+    pub amount: u64,
     pub client_amount: u64,
     pub provider_amount: u64,
 }
@@ -694,7 +711,8 @@ pub struct DisputeResolved {
 #[event]
 pub struct EscrowCancelled {
     pub escrow: Pubkey,
-    pub cancelled_by: Pubkey,
+    pub actor: Pubkey,
+    pub amount: u64,
 }
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
@@ -711,10 +729,41 @@ pub enum EscrowError {
     DeadlineInPast,
     #[msg("Description exceeds maximum length of 256 characters")]
     DescriptionTooLong,
-    #[msg("Hash exceeds maximum length of 64 characters")]
-    HashTooLong,
     #[msg("Arithmetic overflow in fee calculation")]
     ArithmeticOverflow,
     #[msg("Hash must be exactly 64 hexadecimal characters (sha256 hex)")]
     InvalidHashFormat,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_proof_accepts_valid_hex() {
+        let input = "ABCDEF0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789";
+        let parsed = Sha256HexProof::parse(input).expect("valid proof must parse");
+        assert_eq!(
+            parsed.into_inner(),
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn sha256_proof_rejects_wrong_length() {
+        assert!(Sha256HexProof::parse("abcd").is_err());
+        assert!(Sha256HexProof::parse(&"a".repeat(63)).is_err());
+        assert!(Sha256HexProof::parse(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn sha256_proof_rejects_non_hex_chars() {
+        let mut bad = "a".repeat(64);
+        bad.replace_range(10..11, "g");
+        assert!(Sha256HexProof::parse(&bad).is_err());
+
+        let mut bad_symbol = "a".repeat(64);
+        bad_symbol.replace_range(0..1, "-");
+        assert!(Sha256HexProof::parse(&bad_symbol).is_err());
+    }
 }
