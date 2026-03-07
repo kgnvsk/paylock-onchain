@@ -62,6 +62,16 @@ describe("PayLock Escrow", () => {
   const ESCROW_AMOUNT = new BN(1_000_000); // 1 USDC (6 decimals)
   const DEADLINE_OFFSET = 3600; // 1 hour from now
 
+  async function expectTxFailure(tx: Promise<string>, expected: string) {
+    try {
+      await tx;
+      expect.fail(`Expected tx to fail with '${expected}'`);
+    } catch (e: any) {
+      const msg = String(e?.error?.errorMessage || e?.message || e);
+      expect(msg).to.include(expected);
+    }
+  }
+
   before(async () => {
     // Airdrop SOL to all parties
     await Promise.all([
@@ -304,7 +314,7 @@ describe("PayLock Escrow", () => {
 
     // Create
     await program.methods
-      .createEscrow("Dispute test contract", "", new BN(2_000_000), new BN(deadline))
+      .createEscrow("Dispute test contract", sha256hex("dispute-delivery"), new BN(2_000_000), new BN(deadline))
       .accounts({
         client: client2.publicKey,
         provider: provider2.publicKey,
@@ -386,7 +396,7 @@ describe("PayLock Escrow", () => {
     const deadline = Math.floor(Date.now() / 1000) + DEADLINE_OFFSET;
 
     await program.methods
-      .createEscrow("Cancel test", "", new BN(500_000), new BN(deadline))
+      .createEscrow("Cancel test", sha256hex("cancel-delivery"), new BN(500_000), new BN(deadline))
       .accounts({
         client: client3.publicKey, provider: provider3.publicKey,
         mint,
@@ -414,5 +424,271 @@ describe("PayLock Escrow", () => {
     const escrow3 = await program.account.escrowAccount.fetch(escrow3PDA);
     expect(escrow3.status).to.deep.equal({ cancelled: {} });
     console.log("✅ Escrow cancelled successfully");
+  });
+
+  it("Rejects invalid hash format on create_escrow and submit_delivery", async () => {
+    const client4 = Keypair.generate();
+    const provider4 = Keypair.generate();
+
+    await Promise.all([
+      provider.connection.requestAirdrop(client4.publicKey, 2e9),
+      provider.connection.requestAirdrop(provider4.publicKey, 2e9),
+    ]);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const client4TokenAcc = await createAssociatedTokenAccount(
+      provider.connection, client4, mint, client4.publicKey
+    );
+    await mintTo(provider.connection, client4, mint, client4TokenAcc, client.publicKey, 1_000_000);
+
+    const [escrow4PDA] = await getEscrowPDA(client4.publicKey, provider4.publicKey, program.programId);
+    const [vault4PDA] = PublicKey.findProgramAddressSync(
+      [escrow4PDA.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    const deadline = Math.floor(Date.now() / 1000) + DEADLINE_OFFSET;
+
+    await expectTxFailure(
+      program.methods
+        .createEscrow("Bad hash", "not-a-sha256", new BN(500_000), new BN(deadline))
+        .accounts({
+          client: client4.publicKey,
+          provider: provider4.publicKey,
+          mint,
+          arbitrator: treasury.publicKey,
+          treasury: treasury.publicKey,
+          escrow: escrow4PDA,
+          vault: vault4PDA,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          rent: SYSVAR_RENT_PUBKEY,
+        })
+        .signers([client4])
+        .rpc(),
+      "Invalid hash format"
+    );
+
+    await program.methods
+      .createEscrow("Good hash", sha256hex("good-create"), new BN(500_000), new BN(deadline))
+      .accounts({
+        client: client4.publicKey,
+        provider: provider4.publicKey,
+        mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
+        escrow: escrow4PDA,
+        vault: vault4PDA,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .signers([client4])
+      .rpc();
+
+    await program.methods
+      .fundEscrow()
+      .accounts({
+        client: client4.publicKey,
+        escrow: escrow4PDA,
+        clientTokenAccount: client4TokenAcc,
+        vault: vault4PDA,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .signers([client4])
+      .rpc();
+
+    await expectTxFailure(
+      program.methods
+        .submitDelivery("xyz")
+        .accounts({ provider: provider4.publicKey, escrow: escrow4PDA })
+        .signers([provider4])
+        .rpc(),
+      "Invalid hash format"
+    );
+  });
+
+  it("Rejects deadline edge and unauthorized/invalid state transitions", async () => {
+    const client5 = Keypair.generate();
+    const provider5 = Keypair.generate();
+    const attacker = Keypair.generate();
+
+    await Promise.all([
+      provider.connection.requestAirdrop(client5.publicKey, 2e9),
+      provider.connection.requestAirdrop(provider5.publicKey, 2e9),
+      provider.connection.requestAirdrop(attacker.publicKey, 2e9),
+    ]);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const client5TokenAcc = await createAssociatedTokenAccount(provider.connection, client5, mint, client5.publicKey);
+    await mintTo(provider.connection, client5, mint, client5TokenAcc, client.publicKey, 1_500_000);
+
+    const [escrow5PDA] = await getEscrowPDA(client5.publicKey, provider5.publicKey, program.programId);
+    const [vault5PDA] = PublicKey.findProgramAddressSync(
+      [escrow5PDA.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    const nowTs = Math.floor(Date.now() / 1000);
+
+    await expectTxFailure(
+      program.methods
+        .createEscrow("Deadline edge", sha256hex("deadline-edge"), new BN(500_000), new BN(nowTs))
+        .accounts({
+          client: client5.publicKey,
+          provider: provider5.publicKey,
+          mint,
+          arbitrator: treasury.publicKey,
+          treasury: treasury.publicKey,
+          escrow: escrow5PDA,
+          vault: vault5PDA,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          rent: SYSVAR_RENT_PUBKEY,
+        })
+        .signers([client5])
+        .rpc(),
+      "Deadline must be in the future"
+    );
+
+    await program.methods
+      .createEscrow("State machine edge", sha256hex("state-machine-edge"), new BN(500_000), new BN(nowTs + 120))
+      .accounts({
+        client: client5.publicKey,
+        provider: provider5.publicKey,
+        mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
+        escrow: escrow5PDA,
+        vault: vault5PDA,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .signers([client5])
+      .rpc();
+
+    await expectTxFailure(
+      program.methods
+        .submitDelivery(sha256hex("premature"))
+        .accounts({ provider: provider5.publicKey, escrow: escrow5PDA })
+        .signers([provider5])
+        .rpc(),
+      "Escrow is not in the required status"
+    );
+
+    await expectTxFailure(
+      program.methods
+        .disputeEscrow("attacker")
+        .accounts({ authority: attacker.publicKey, escrow: escrow5PDA })
+        .signers([attacker])
+        .rpc(),
+      "Caller is not authorized"
+    );
+  });
+
+  it("Rejects treasury/arbitrator mismatch attempts", async () => {
+    const rogueTreasury = Keypair.generate();
+    const rogueArbitrator = Keypair.generate();
+    const client6 = Keypair.generate();
+    const provider6 = Keypair.generate();
+
+    await Promise.all([
+      provider.connection.requestAirdrop(client6.publicKey, 2e9),
+      provider.connection.requestAirdrop(provider6.publicKey, 2e9),
+      provider.connection.requestAirdrop(rogueTreasury.publicKey, 2e9),
+      provider.connection.requestAirdrop(rogueArbitrator.publicKey, 2e9),
+    ]);
+    await new Promise((r) => setTimeout(r, 1500));
+
+    const client6TokenAcc = await createAssociatedTokenAccount(provider.connection, client6, mint, client6.publicKey);
+    const provider6TokenAcc = await createAssociatedTokenAccount(provider.connection, provider6, mint, provider6.publicKey);
+    const rogueTreasuryTokenAcc = await createAssociatedTokenAccount(provider.connection, rogueTreasury, mint, rogueTreasury.publicKey);
+    await mintTo(provider.connection, client6, mint, client6TokenAcc, client.publicKey, 2_000_000);
+
+    const [escrow6PDA] = await getEscrowPDA(client6.publicKey, provider6.publicKey, program.programId);
+    const [vault6PDA] = PublicKey.findProgramAddressSync(
+      [escrow6PDA.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+    const deadline = Math.floor(Date.now() / 1000) + DEADLINE_OFFSET;
+
+    await program.methods
+      .createEscrow("Mismatch checks", sha256hex("mismatch-checks"), new BN(1_000_000), new BN(deadline))
+      .accounts({
+        client: client6.publicKey,
+        provider: provider6.publicKey,
+        mint,
+        arbitrator: treasury.publicKey,
+        treasury: treasury.publicKey,
+        escrow: escrow6PDA,
+        vault: vault6PDA,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        rent: SYSVAR_RENT_PUBKEY,
+      })
+      .signers([client6])
+      .rpc();
+
+    await program.methods
+      .fundEscrow()
+      .accounts({
+        client: client6.publicKey,
+        escrow: escrow6PDA,
+        clientTokenAccount: client6TokenAcc,
+        vault: vault6PDA,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .signers([client6])
+      .rpc();
+
+    await expectTxFailure(
+      program.methods
+        .releaseEscrow()
+        .accounts({
+          authority: client6.publicKey,
+          treasury: rogueTreasury.publicKey,
+          escrow: escrow6PDA,
+          vault: vault6PDA,
+          providerTokenAccount: provider6TokenAcc,
+          treasuryTokenAccount: rogueTreasuryTokenAcc,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        })
+        .signers([client6])
+        .rpc(),
+      "has one constraint was violated"
+    );
+
+    await program.methods
+      .disputeEscrow("prep for resolve auth test")
+      .accounts({ authority: client6.publicKey, escrow: escrow6PDA })
+      .signers([client6])
+      .rpc();
+
+    await expectTxFailure(
+      program.methods
+        .resolveDispute(new BN(5000))
+        .accounts({
+          arbitrator: rogueArbitrator.publicKey,
+          escrow: escrow6PDA,
+          vault: vault6PDA,
+          clientTokenAccount: client6TokenAcc,
+          providerTokenAccount: provider6TokenAcc,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        })
+        .signers([rogueArbitrator])
+        .rpc(),
+      "has one constraint was violated"
+    );
   });
 });

@@ -12,6 +12,10 @@ const BPS_DENOMINATOR: u64 = 10_000;
 const MAX_DESCRIPTION_LEN: usize = 256;
 const MAX_DELIVERY_HASH_LEN: usize = 64;
 
+fn is_valid_sha256_hex(hash: &str) -> bool {
+    hash.len() == MAX_DELIVERY_HASH_LEN && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 // ─── Program ─────────────────────────────────────────────────────────────────
 #[program]
 pub mod paylock_escrow {
@@ -25,10 +29,23 @@ pub mod paylock_escrow {
         amount: u64,
         deadline: i64,
     ) -> Result<()> {
-        require!(description.len() <= MAX_DESCRIPTION_LEN, EscrowError::DescriptionTooLong);
-        require!(delivery_hash.len() <= MAX_DELIVERY_HASH_LEN, EscrowError::HashTooLong);
+        require!(
+            description.len() <= MAX_DESCRIPTION_LEN,
+            EscrowError::DescriptionTooLong
+        );
+        require!(
+            delivery_hash.len() <= MAX_DELIVERY_HASH_LEN,
+            EscrowError::HashTooLong
+        );
+        require!(
+            is_valid_sha256_hex(&delivery_hash),
+            EscrowError::InvalidHashFormat
+        );
         require!(amount > 0, EscrowError::InvalidAmount);
-        require!(deadline > Clock::get()?.unix_timestamp, EscrowError::DeadlineInPast);
+        require!(
+            deadline > Clock::get()?.unix_timestamp,
+            EscrowError::DeadlineInPast
+        );
 
         let escrow = &mut ctx.accounts.escrow;
         escrow.client = ctx.accounts.client.key();
@@ -82,14 +99,24 @@ pub mod paylock_escrow {
         let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Funded;
 
-        emit!(EscrowFunded { escrow: escrow.key(), amount });
+        emit!(EscrowFunded {
+            escrow: escrow.key(),
+            amount
+        });
 
         Ok(())
     }
 
     /// Provider submits delivery proof hash.
     pub fn submit_delivery(ctx: Context<SubmitDelivery>, verify_hash: String) -> Result<()> {
-        require!(verify_hash.len() <= MAX_DELIVERY_HASH_LEN, EscrowError::HashTooLong);
+        require!(
+            verify_hash.len() <= MAX_DELIVERY_HASH_LEN,
+            EscrowError::HashTooLong
+        );
+        require!(
+            is_valid_sha256_hex(&verify_hash),
+            EscrowError::InvalidHashFormat
+        );
         require!(
             ctx.accounts.escrow.status == EscrowStatus::Funded,
             EscrowError::InvalidStatus
@@ -100,7 +127,10 @@ pub mod paylock_escrow {
         escrow.verify_hash = verify_hash;
         escrow.status = EscrowStatus::DeliverySubmitted;
 
-        emit!(DeliverySubmitted { escrow: escrow.key(), provider: provider_key });
+        emit!(DeliverySubmitted {
+            escrow: escrow.key(),
+            provider: provider_key
+        });
 
         Ok(())
     }
@@ -123,7 +153,9 @@ pub mod paylock_escrow {
         let caller_is_client = ctx.accounts.authority.key() == ctx.accounts.escrow.client;
 
         require!(
-            caller_is_client || auto_approved || clock.unix_timestamp > ctx.accounts.escrow.deadline,
+            caller_is_client
+                || auto_approved
+                || clock.unix_timestamp > ctx.accounts.escrow.deadline,
             EscrowError::Unauthorized
         );
 
@@ -133,8 +165,14 @@ pub mod paylock_escrow {
         let provider_key = ctx.accounts.escrow.provider;
         let bump = ctx.accounts.escrow.bump;
 
-        let fee_amount = amount.checked_mul(fee_bps).ok_or(EscrowError::ArithmeticOverflow)?.checked_div(BPS_DENOMINATOR).ok_or(EscrowError::ArithmeticOverflow)?;
-        let provider_amount = amount.checked_sub(fee_amount).ok_or(EscrowError::ArithmeticOverflow)?;
+        let fee_amount = amount
+            .checked_mul(fee_bps)
+            .ok_or(EscrowError::ArithmeticOverflow)?
+            .checked_div(BPS_DENOMINATOR)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        let provider_amount = amount
+            .checked_sub(fee_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
 
         // Build signer seeds
         let client_ref = client_key.as_ref().to_vec();
@@ -183,7 +221,11 @@ pub mod paylock_escrow {
         let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Released;
 
-        emit!(EscrowReleased { escrow: escrow.key(), provider_amount, fee_amount });
+        emit!(EscrowReleased {
+            escrow: escrow.key(),
+            provider_amount,
+            fee_amount
+        });
 
         Ok(())
     }
@@ -205,14 +247,21 @@ pub mod paylock_escrow {
         let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Disputed;
 
-        emit!(EscrowDisputed { escrow: escrow.key(), disputer: caller, reason });
+        emit!(EscrowDisputed {
+            escrow: escrow.key(),
+            disputer: caller,
+            reason
+        });
 
         Ok(())
     }
 
     /// Resolve a dispute. Only arbitrator can call.
     pub fn resolve_dispute(ctx: Context<ResolveDispute>, client_share_bps: u64) -> Result<()> {
-        require!(client_share_bps <= BPS_DENOMINATOR, EscrowError::InvalidAmount);
+        require!(
+            client_share_bps <= BPS_DENOMINATOR,
+            EscrowError::InvalidAmount
+        );
         require!(
             ctx.accounts.escrow.status == EscrowStatus::Disputed,
             EscrowError::InvalidStatus
@@ -223,8 +272,14 @@ pub mod paylock_escrow {
         let provider_key = ctx.accounts.escrow.provider;
         let bump = ctx.accounts.escrow.bump;
 
-        let client_amount = amount.checked_mul(client_share_bps).ok_or(EscrowError::ArithmeticOverflow)?.checked_div(BPS_DENOMINATOR).ok_or(EscrowError::ArithmeticOverflow)?;
-        let provider_amount = amount.checked_sub(client_amount).ok_or(EscrowError::ArithmeticOverflow)?;
+        let client_amount = amount
+            .checked_mul(client_share_bps)
+            .ok_or(EscrowError::ArithmeticOverflow)?
+            .checked_div(BPS_DENOMINATOR)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
+        let provider_amount = amount
+            .checked_sub(client_amount)
+            .ok_or(EscrowError::ArithmeticOverflow)?;
 
         let client_ref = client_key.as_ref().to_vec();
         let provider_ref = provider_key.as_ref().to_vec();
@@ -271,7 +326,11 @@ pub mod paylock_escrow {
         let escrow = &mut ctx.accounts.escrow;
         escrow.status = EscrowStatus::Resolved;
 
-        emit!(DisputeResolved { escrow: escrow.key(), client_amount, provider_amount });
+        emit!(DisputeResolved {
+            escrow: escrow.key(),
+            client_amount,
+            provider_amount
+        });
 
         Ok(())
     }
@@ -295,7 +354,10 @@ pub mod paylock_escrow {
             }
             EscrowStatus::Funded | EscrowStatus::DeliverySubmitted => {
                 require!(caller == client_key, EscrowError::Unauthorized);
-                require!(clock.unix_timestamp > ctx.accounts.escrow.deadline, EscrowError::Unauthorized);
+                require!(
+                    clock.unix_timestamp > ctx.accounts.escrow.deadline,
+                    EscrowError::Unauthorized
+                );
 
                 let client_ref = client_key.as_ref().to_vec();
                 let provider_ref = provider_key.as_ref().to_vec();
@@ -327,7 +389,10 @@ pub mod paylock_escrow {
             _ => return err!(EscrowError::InvalidStatus),
         }
 
-        emit!(EscrowCancelled { escrow: ctx.accounts.escrow.key(), cancelled_by: caller });
+        emit!(EscrowCancelled {
+            escrow: ctx.accounts.escrow.key(),
+            cancelled_by: caller
+        });
 
         Ok(())
     }
@@ -568,7 +633,7 @@ impl EscrowAccount {
         + 4 + MAX_DELIVERY_HASH_LEN
         + 1                   // status
         + 1                   // bump
-        + 64;                 // padding
+        + 64; // padding
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
@@ -650,4 +715,6 @@ pub enum EscrowError {
     HashTooLong,
     #[msg("Arithmetic overflow in fee calculation")]
     ArithmeticOverflow,
+    #[msg("Hash must be exactly 64 hexadecimal characters (sha256 hex)")]
+    InvalidHashFormat,
 }
