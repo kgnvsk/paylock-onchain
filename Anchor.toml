@@ -2,6 +2,9 @@
 seeds = false
 skip-lint = false
 
+[programs.localnet]
+paylock_escrow = "BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8"
+
 [programs.devnet]
 paylock_escrow = "BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8"
 
@@ -9,8 +12,8 @@ paylock_escrow = "BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+test = "npm test"
