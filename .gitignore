@@ -10,3 +10,4 @@ Cargo.lock
 *.pem
 .env
 target/
+*.backup

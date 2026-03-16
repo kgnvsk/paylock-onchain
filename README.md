@@ -11,8 +11,13 @@
 
 PayLock is an escrow protocol for AI agent deals and freelance contracts. A **client** locks funds for a **provider**; funds are released only after verified delivery. The original system was a centralized Python API — this repo is the full on-chain rebuild.
 
-**Deployed on Devnet:** `BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8`  
-*(Run `anchor deploy --provider.cluster devnet` to get a live address)*
+**Deployed on Devnet:**
+
+| Network | Program ID | Explorer |
+|---------|-----------|---------|
+| Solana Devnet | `BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8` | [View →](https://explorer.solana.com/address/BgWSFpXL2tzGTk2N8ihVF5WdNM3q9e9jRuMLJGKWnBA8?cluster=devnet) |
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full deployment details, CPI usage, and verification steps.
 
 ## 📐 Architecture
 
