@@ -164,3 +164,28 @@ Ping me with "продолжай Phase 2 с Sepolia deploy готов, address=0
 - `/srv/cash2/openclaw-workspace/projects/agent-escrow/paylock/chain.py` (dispatcher)
 
 Branch: `feat/evm-escrow-base` on `kgnvsk/paylock-onchain`.
+
+---
+
+## Deployment Record
+
+**Date:** 2026-04-22
+**Network:** Base Sepolia (chain 84532)
+**Contract address:** `0xcBe994F0e33Af41033dE22af7fd9624dC9889194`
+**BaseScan:** https://sepolia.basescan.org/address/0xcBe994F0e33Af41033dE22af7fd9624dC9889194
+**Admin:** `0x6714AA19634a90e581f2578853c7c60b93821f9f`
+**Treasury:** `0x6714AA19634a90e581f2578853c7c60b93821f9f` (testnet — same as admin)
+**Constructor args:** `usdc=0x036CbD53842c5426634e7929541eC2318f3dCF7e`, `admin=0x6714...`, `treasury=0x6714...`, `maxLocked=10_000_000_000` (10k USDC, 6 decimals)
+**Gas used:** ~1.99M (actual cost: ~0.000009 ETH at 0.011 gwei = ~$0.04)
+**Deployer balance post-deploy:** 0.000390 ETH
+
+**Verified on-chain via cast:**
+- `admin()` → 0x6714AA19634a90e581f2578853c7c60b93821f9f ✓
+- `treasury()` → 0x6714AA19634a90e581f2578853c7c60b93821f9f ✓
+- `maxLocked()` → 10_000_000_000 (10k USDC) ✓
+- `FEE_BPS()` → 200 (2%) ✓
+- `paused()` → false ✓
+
+**Next steps (blocked on testnet USDC):**
+- Request USDC via Circle faucet: https://faucet.circle.com (select Base Sepolia)
+- E2E test: approve → createEscrow → deposit → submitDelivery → release
