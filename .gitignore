@@ -11,3 +11,12 @@ Cargo.lock
 .env
 target/
 *.backup
+
+# Foundry
+out/
+cache/
+broadcast/
+
+# Secrets
+.env
+.env.local
