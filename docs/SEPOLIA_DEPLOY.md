@@ -189,3 +189,33 @@ Branch: `feat/evm-escrow-base` on `kgnvsk/paylock-onchain`.
 **Next steps (blocked on testnet USDC):**
 - Request USDC via Circle faucet: https://faucet.circle.com (select Base Sepolia)
 - E2E test: approve → createEscrow → deposit → submitDelivery → release
+
+---
+
+## E2E Sepolia Run — 2026-04-22
+
+**Script:** `script/e2e_sepolia.py` (requires `web3` + `eth-account` + `BASE_ADMIN_PRIVATE_KEY` env).
+
+**Successful run:**
+- Admin (buyer, treasury): `0x6714AA19634a90e581f2578853c7c60b93821f9f`
+- Seller (ephemeral): generated fresh each run
+- Amount: 1 USDC
+- Flow: createEscrow → approve → deposit → submitDelivery (seller) → release
+
+**On-chain outcome:**
+- Admin USDC: 20.00 → 18.02 (−1.98; one full E2E run = 1 USDC and one older stuck escrow from partial run)
+- Seller USDC: 0 → 0.98 (= 1.00 − 2% fee)
+- Treasury USDC: +0.02 (treasury = admin, so admin net received fee back)
+- `totalLocked()`: 1 USDC (stuck escrow from earlier partial run, refundable after deadline)
+- Contract USDC balance == `totalLocked()` invariant holds ✓
+
+**Gas totals:** ~0.00012 ETH for full flow (5 tx + 1 ETH transfer to seller).
+
+**Verification:**
+- Fee math: seller received 98%, treasury received 2% — matches `FEE_BPS=200`
+- State transition: `None → Created → Funded → Delivered → Released` (contract enum values 0→1→2→3→4)
+- Hash match: `verifyHash == deliveryHash` triggered release permissionlessly (anyone can call `release()`)
+
+**Known leftover:** 1 USDC locked in contract from earlier partial run where seller
+ran out of gas mid-submitDelivery. Refundable via `refund(id)` after deadline +
+48h challenge window. Not a bug — contract state consistent.
